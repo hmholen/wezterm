@@ -2,12 +2,17 @@
 direction by half of the given round-trip time (ms). Order is preserved.
 
 usage: lagproxy.py <rtt-ms> <socket-path>
+
+LAG_JITTER_MS adds up to that much extra random delay per chunk; order is
+still preserved, so later chunks queue behind slow ones and arrive in bursts
+like on a real long-distance link.
 """
-import os, queue, socket, sys, threading, time
+import os, queue, random, socket, sys, threading, time
 
 one_way = float(sys.argv[1]) / 2000.0
 START = time.monotonic()
 TRACE = os.environ.get('LAG_TRACE')
+JITTER = float(os.environ.get('LAG_JITTER_MS', '0')) / 1000.0
 
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(sys.argv[2])
@@ -26,7 +31,7 @@ def relay(read, write, close, name):
             if TRACE:
                 with open(TRACE, 'a') as f:
                     f.write('%8.3f %-4s %5d %s\n' % (t - START, name, len(data), data[:24].hex()))
-            q.put((t + one_way, data))
+            q.put((t + one_way + random.uniform(0, JITTER), data))
             if not data:
                 return
 

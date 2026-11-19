@@ -1,6 +1,6 @@
 use crate::domain::ClientInner;
 use crate::pane::clientpane::ClientPane;
-use crate::pane::predict::{self, Outcome, PredKey, Predictor, MISMATCH_GRACE, PENDING_SLACK};
+use crate::pane::predict::{self, Outcome, PredKey, Predictor, PENDING_SLACK};
 use anyhow::anyhow;
 use codec::*;
 use config::{configuration, ConfigHandle};
@@ -181,16 +181,26 @@ impl RenderableInner {
     /// confirmed in time. Returns true if the display changed.
     fn expire_prediction(&mut self) -> bool {
         let rtt = self.prediction_rtt();
-        let expired = self
+        let reason = self
             .predictor
             .as_ref()
-            .map(|pred| pred.expired(Instant::now(), rtt))
-            .unwrap_or(false);
-        if expired {
-            log::trace!("prediction expired for local={}", self.local_pane_id);
-            self.clear_prediction();
+            .and_then(|pred| pred.expiry_reason(Instant::now(), rtt));
+        match reason {
+            Some(reason) => {
+                if let Some(pred) = &self.predictor {
+                    log::trace!(
+                        target: "wezterm_client::pane::predict",
+                        "expired ({}, rtt {:?}); history {}",
+                        reason,
+                        rtt,
+                        pred.describe_history()
+                    );
+                }
+                self.clear_prediction();
+                true
+            }
+            None => false,
         }
-        expired
     }
 
     fn schedule_prediction_check(&self, delay: Duration) {
@@ -441,7 +451,9 @@ impl RenderableInner {
                         // Keep showing the prediction.
                         Outcome::Keep => None,
                         Outcome::Hold => {
-                            self.schedule_prediction_check(MISMATCH_GRACE);
+                            self.schedule_prediction_check(predict::mismatch_grace(
+                                self.prediction_rtt(),
+                            ));
                             None
                         }
                     }

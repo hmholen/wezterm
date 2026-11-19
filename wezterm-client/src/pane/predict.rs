@@ -31,9 +31,18 @@ use termwiz::color::ColorAttribute;
 use termwiz::surface::SEQ_ZERO;
 use wezterm_term::{Line, StableRowIndex};
 
+/// Shortest time an unrecognised server state may persist before the
+/// prediction is abandoned in favour of what the server shows.
+pub const MIN_MISMATCH_GRACE: Duration = Duration::from_millis(150);
+
 /// How long an unrecognised server state may persist before the prediction
-/// is abandoned in favour of what the server shows.
-pub const MISMATCH_GRACE: Duration = Duration::from_millis(150);
+/// is abandoned. An unrecognised state is often a snapshot taken while the
+/// application was half way through redrawing the line; the snapshot that
+/// corrects it may only arrive with the next burst of updates, so give it
+/// a round trip.
+pub fn mismatch_grace(rtt: Duration) -> Duration {
+    (rtt + Duration::from_millis(100)).max(MIN_MISMATCH_GRACE)
+}
 
 /// Extra time, on top of two round trips, before an unconfirmed key is
 /// considered lost and the prediction abandoned.
@@ -66,6 +75,11 @@ impl EditState {
         let trimmed = text.trim_end_matches(' ').len();
         text.truncate(trimmed);
         Self { cursor_x, text }
+    }
+
+    /// Compact form for logging: `x=<col> "<text left of cursor>"`.
+    pub fn describe(&self) -> String {
+        format!("x={} {:?}", self.cursor_x, self.text)
     }
 }
 
@@ -161,7 +175,7 @@ pub enum Outcome {
     /// The server is behind but on track: keep displaying the prediction.
     Keep,
     /// The server state is not one we predicted: keep the current display
-    /// for now and re-check after `MISMATCH_GRACE`.
+    /// for now and re-check after `mismatch_grace`.
     Hold,
 }
 
@@ -237,15 +251,16 @@ impl Predictor {
         self.server_line = line.clone();
         let state = EditState::capture(line, server_cursor_x);
 
-        match self.pending.last() {
-            None => return Outcome::Done,
-            Some(last) if last.after == state => return Outcome::Done,
-            _ => {}
-        }
+        let caught_up = match self.pending.last() {
+            None => true,
+            Some(last) => last.after == state,
+        };
 
-        // The server is behind: find how far it has got. Earliest match
-        // wins, since the server passes through our states in order.
-        let confirmed = if self.base == state {
+        // Otherwise the server is behind: find how far it has got. Earliest
+        // match wins, since the server passes through our states in order.
+        let confirmed = if caught_up {
+            None
+        } else if self.base == state {
             Some(0)
         } else {
             self.pending
@@ -254,7 +269,8 @@ impl Predictor {
                 .map(|idx| idx + 1)
         };
 
-        match confirmed {
+        let outcome = match confirmed {
+            _ if caught_up => Outcome::Done,
             Some(n) => {
                 if n > 0 {
                     self.base = self.pending[n - 1].after.clone();
@@ -268,20 +284,49 @@ impl Predictor {
                 self.mismatch_since.get_or_insert(now);
                 Outcome::Hold
             }
+        };
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!(
+                "server {} -> {:?}{}; history {}",
+                state.describe(),
+                outcome,
+                if self.barrier { " (barrier)" } else { "" },
+                self.describe_history()
+            );
+        }
+        outcome
+    }
+
+    /// `base` and the state after each pending key, for logging.
+    pub fn describe_history(&self) -> String {
+        let mut out = self.base.describe();
+        for p in &self.pending {
+            out.push_str(" > ");
+            out.push_str(&p.after.describe());
+        }
+        out
+    }
+
+    /// Why the prediction should be abandoned now, if it should.
+    pub fn expiry_reason(&self, now: Instant, rtt: Duration) -> Option<&'static str> {
+        if let Some(since) = self.mismatch_since {
+            if now.duration_since(since) >= mismatch_grace(rtt) {
+                return Some("server state matched no prediction");
+            }
+        }
+        match self.pending.first() {
+            Some(oldest) if now.duration_since(oldest.sent) >= rtt * 2 + PENDING_SLACK => {
+                Some("keys not confirmed in time")
+            }
+            Some(_) => None,
+            None => Some("nothing pending"),
         }
     }
 
     /// True once the prediction should be abandoned.
+    #[cfg(test)]
     pub fn expired(&self, now: Instant, rtt: Duration) -> bool {
-        if let Some(since) = self.mismatch_since {
-            if now.duration_since(since) >= MISMATCH_GRACE {
-                return true;
-            }
-        }
-        match self.pending.first() {
-            Some(oldest) => now.duration_since(oldest.sent) >= rtt * 2 + PENDING_SLACK,
-            None => true,
-        }
+        self.expiry_reason(now, rtt).is_some()
     }
 }
 
@@ -497,7 +542,11 @@ mod test {
         assert_eq!(sim.shown(), ("h:~% jj".to_string(), 7), "held during grace");
         let rtt = Duration::from_millis(300);
         assert!(!sim.pred.expired(sim.now, rtt));
-        assert!(sim.pred.expired(sim.now + MISMATCH_GRACE, rtt));
+        // A follow-up snapshot may take a round trip to arrive.
+        assert!(!sim.pred.expired(sim.now + MIN_MISMATCH_GRACE, rtt));
+        assert!(sim.pred.expired(sim.now + mismatch_grace(rtt), rtt));
+        assert_eq!(mismatch_grace(rtt), Duration::from_millis(400));
+        assert_eq!(mismatch_grace(Duration::ZERO), MIN_MISMATCH_GRACE);
     }
 
     #[test]
