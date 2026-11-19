@@ -366,6 +366,12 @@ impl Pane for ClientPane {
     }
 
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
+        // Whatever is written here bypasses local echo prediction.
+        self.renderable
+            .lock()
+            .inner
+            .borrow_mut()
+            .note_unpredicted_input();
         MutexGuard::map(self.writer.lock(), |writer| {
             let w: &mut dyn std::io::Write = writer;
             w

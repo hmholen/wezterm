@@ -88,6 +88,29 @@ local function start()
     { 2.0, function() sampling = true; sample(pane) end },
     { 0.3, set_phase('type') },
   }
+  if E('SCENARIO') == 'shiftspace' then
+    type_str(steps, 'lets')
+    table.insert(steps, { GAP, key('Space', 'SHIFT') })
+    type_str(steps, 'goo')
+    table.insert(steps, { 3, set_phase('done') })
+    table.insert(steps, { 0.3, key('u', 'CTRL') })
+    table.insert(steps, { 1, function(w, p) log('END'); w:perform_action(act.QuitApplication, p) end })
+    run(window, pane, steps)
+    return
+  end
+  if E('SCENARIO') == 'ctrlb' then
+    -- an unpredictable key (Ctrl+B: cursor left in zsh) while nothing is
+    -- being predicted, then typing straight away
+    type_str(steps, 'lets ')
+    table.insert(steps, { 2.5, set_phase('ctrlb') })
+    table.insert(steps, { GAP, key('b', 'CTRL') })
+    type_str(steps, 'goooo')
+    table.insert(steps, { 3, set_phase('done') })
+    table.insert(steps, { 0.3, key('u', 'CTRL') })
+    table.insert(steps, { 1, function(w, p) log('END'); w:perform_action(act.QuitApplication, p) end })
+    run(window, pane, steps)
+    return
+  end
   if E('SCENARIO') == 'hold' then
     -- held-down Backspace that overshoots the start of the input, then
     -- typing straight away

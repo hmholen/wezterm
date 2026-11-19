@@ -48,6 +48,12 @@ pub fn mismatch_grace(rtt: Duration) -> Duration {
 /// considered lost and the prediction abandoned.
 pub const PENDING_SLACK: Duration = Duration::from_millis(400);
 
+/// After input we could not predict (Ctrl+B, Tab, Enter, ...), new
+/// predictions wait until the server has acknowledged that input and then
+/// this much longer, so the application's reaction has arrived and the
+/// display we predict on top of is current.
+pub const UNPREDICTED_SETTLE: Duration = Duration::from_millis(50);
+
 /// Never give up on unconfirmed keys sooner than this: long links have lag
 /// spikes well beyond the measured round trip, and falling back to the
 /// (stale) server state mid-spike looks like a rollback.

@@ -90,6 +90,19 @@ pub struct RenderableInner {
     input_starts: HashMap<StableRowIndex, usize>,
     /// When the earliest pending prediction timer fires.
     prediction_check_at: Option<Instant>,
+    /// Serial of the key being processed, if the input being predicted is
+    /// a key (pastes and raw writes have none).
+    current_input: Option<InputSerial>,
+    /// The most recent input we could not predict: its serial (keys only)
+    /// and when it was sent. Blocks new predictions until it has settled.
+    unpredicted: Option<(Option<InputSerial>, Instant)>,
+    /// Predictable keys typed while waiting for unpredicted input to
+    /// settle, with their serials. They are predicted on top of the
+    /// snapshot the server took as the first of them arrived.
+    deferred: Vec<(PredKey, InputSerial)>,
+    /// Newest input serial the server has acknowledged, and when.
+    acked_serial: InputSerial,
+    acked_at: Instant,
 }
 
 pub struct RenderableState {
@@ -133,6 +146,11 @@ impl RenderableInner {
             server_cursor: StableCursorPosition::default(),
             input_starts: HashMap::new(),
             prediction_check_at: None,
+            current_input: None,
+            unpredicted: None,
+            deferred: vec![],
+            acked_serial: InputSerial::empty(),
+            acked_at: now,
         }
     }
 
@@ -168,6 +186,86 @@ impl RenderableInner {
         if let Some(pred) = self.predictor.as_mut() {
             pred.barrier = true;
         }
+        self.unpredicted = Some((self.current_input, Instant::now()));
+        self.deferred.clear();
+    }
+
+    /// The server's reply to the first deferred key carries a snapshot
+    /// taken as that key arrived: the state the deferred keys apply to.
+    /// Predict them on top of it, so typing straight after an
+    /// unpredictable key is echoed as soon as that is possible.
+    fn replay_deferred_keys(&mut self, serial: Option<InputSerial>, cursor: StableCursorPosition) {
+        let first = match self.deferred.first() {
+            Some(&(_, first)) => first,
+            None => return,
+        };
+        match serial {
+            Some(serial) if serial == first && self.predictor.is_none() => {}
+            // A later reply already includes some of the deferred keys;
+            // replaying them would double them. Wait for the last one.
+            Some(serial) if serial > first => {
+                if let Some(&(_, last)) = self.deferred.last() {
+                    self.unpredicted = Some((Some(last), Instant::now()));
+                }
+                self.deferred.clear();
+                return;
+            }
+            _ => return,
+        }
+        let keys: Vec<PredKey> = self.deferred.drain(..).map(|(key, _)| key).collect();
+        log::trace!(
+            target: "wezterm_client::pane::predict",
+            "replaying {} deferred keys at x={}",
+            keys.len(),
+            cursor.x
+        );
+        self.unpredicted = None;
+        self.cursor_position = cursor;
+        let mut predicted = false;
+        for key in keys {
+            if !self.predict_key(key) {
+                break;
+            }
+            predicted = true;
+        }
+        if predicted {
+            self.schedule_prediction_check(predict::pending_timeout(self.prediction_rtt()));
+        }
+    }
+
+    /// Input that bypasses prediction entirely (raw writes to the pane).
+    pub fn note_unpredicted_input(&mut self) {
+        self.current_input = None;
+        self.prediction_barrier();
+    }
+
+    /// True once the last unpredicted input has been acknowledged by the
+    /// server and its effect has had time to arrive, so a new prediction
+    /// starts from an up to date display.
+    fn unpredicted_input_settled(&mut self) -> bool {
+        let (serial, sent) = match self.unpredicted {
+            None => return true,
+            Some(u) => u,
+        };
+        let rtt = self.prediction_rtt();
+        let settled = match serial {
+            Some(serial) => {
+                (self.acked_serial >= serial
+                    && self.acked_at.elapsed() >= predict::UNPREDICTED_SETTLE)
+                    || sent.elapsed() >= predict::pending_timeout(rtt)
+            }
+            // Pastes and raw writes are not acknowledged individually.
+            None => sent.elapsed() >= rtt + Duration::from_millis(200),
+        };
+        if settled {
+            self.unpredicted = None;
+        } else {
+            log::trace!(
+                target: "wezterm_client::pane::predict",
+                "not predicting: waiting for earlier unpredicted input to settle"
+            );
+        }
+        settled
     }
 
     /// Abandon the prediction and show the most recent server state.
@@ -262,6 +360,10 @@ impl RenderableInner {
             self.prediction_barrier();
             return false;
         }
+        if self.predictor.is_none() && !self.unpredicted_input_settled() {
+            self.prediction_barrier();
+            return false;
+        }
         if let Some(pred) = &self.predictor {
             if pred.row != row || !pred.can_predict(key, x, cols) {
                 self.prediction_barrier();
@@ -340,6 +442,7 @@ impl RenderableInner {
         if key.is_modifier() {
             return;
         }
+        self.current_input = Some(self.input_serial);
         let mods = mods.remove_positional_mods();
         let plain = mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT;
         let pred_key = match key {
@@ -349,6 +452,18 @@ impl RenderableInner {
             _ => None,
         };
         match pred_key {
+            Some(key)
+                if self.should_predict()
+                    && self.predictor.is_none()
+                    && (!self.deferred.is_empty() || !self.unpredicted_input_settled()) =>
+            {
+                log::trace!(
+                    target: "wezterm_client::pane::predict",
+                    "deferring {:?} until earlier unpredicted input settles",
+                    key
+                );
+                self.deferred.push((key, self.input_serial));
+            }
             Some(key) if self.should_predict() => {
                 if self.predict_key(key) {
                     self.schedule_prediction_check(predict::pending_timeout(self.prediction_rtt()));
@@ -359,6 +474,7 @@ impl RenderableInner {
     }
 
     pub fn predict_from_paste(&mut self, text: &str) {
+        self.current_input = None;
         let simple = !text.is_empty()
             && text.chars().count() <= self.dimensions.cols
             && text.chars().all(predict::is_simple_char);
@@ -412,6 +528,10 @@ impl RenderableInner {
         // long it took for this response to come back
         if let Some(serial) = delta.input_serial {
             self.last_input_rtt = serial.elapsed_millis();
+            if serial >= self.acked_serial {
+                self.acked_serial = serial;
+                self.acked_at = now;
+            }
         }
 
         // When it comes to updating the cursor position, if the update was tagged
@@ -528,6 +648,7 @@ impl RenderableInner {
             None if was_predicting => self.cursor_position = delta.cursor_position,
             None => {}
         }
+        self.replay_deferred_keys(delta.input_serial, delta.cursor_position);
 
         log::trace!(
             "apply_changes_to_surface: Generate PaneOutput event for local={}",
