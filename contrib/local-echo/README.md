@@ -17,6 +17,14 @@ config.ssh_domains = {
 }
 ```
 
+## Debugging
+
+`WEZTERM_LOG=wezterm_client::pane::predict=trace` logs each comparison
+(server state, outcome, predicted history) and each expiry with its reason.
+On Windows the GUI log is `%USERPROFILE%\.local\share\wezterm\wezterm-gui.exe-log-<pid>.txt`.
+The trace contains what was typed (prompts that look like they ask for a
+secret are never predicted, so never logged).
+
 ## Unit tests
 
 ```sh
