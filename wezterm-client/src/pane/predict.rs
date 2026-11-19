@@ -48,6 +48,17 @@ pub fn mismatch_grace(rtt: Duration) -> Duration {
 /// considered lost and the prediction abandoned.
 pub const PENDING_SLACK: Duration = Duration::from_millis(400);
 
+/// Never give up on unconfirmed keys sooner than this: long links have lag
+/// spikes well beyond the measured round trip, and falling back to the
+/// (stale) server state mid-spike looks like a rollback.
+pub const MIN_PENDING_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the server may go without confirming any pending key before
+/// the prediction is abandoned.
+pub fn pending_timeout(rtt: Duration) -> Duration {
+    (rtt * 2 + PENDING_SLACK).max(MIN_PENDING_TIMEOUT)
+}
+
 /// The keys we know how to predict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PredKey {
@@ -198,6 +209,8 @@ pub struct Predictor {
     /// unrecognised server state ends the prediction immediately.
     pub barrier: bool,
     pub mismatch_since: Option<Instant>,
+    /// When the server last confirmed a pending key.
+    pub last_progress: Instant,
     /// The most recent server copy of `row`, restored when we give up.
     pub server_line: Line,
 }
@@ -211,6 +224,7 @@ impl Predictor {
             pending: vec![],
             barrier: false,
             mismatch_since: None,
+            last_progress: Instant::now(),
             server_line: line.clone(),
         }
     }
@@ -281,6 +295,7 @@ impl Predictor {
                 if n > 0 {
                     self.base = self.pending[n - 1].after.clone();
                     self.pending.drain(..n);
+                    self.last_progress = now;
                 }
                 self.mismatch_since = None;
                 Outcome::Keep
@@ -344,12 +359,28 @@ impl Predictor {
                 return Some("server state matched no prediction");
             }
         }
-        match self.pending.first() {
-            Some(oldest) if now.duration_since(oldest.sent) >= rtt * 2 + PENDING_SLACK => {
-                Some("keys not confirmed in time")
-            }
+        match self.pending_deadline(rtt) {
+            Some(deadline) if now >= deadline => Some("keys not confirmed in time"),
             Some(_) => None,
             None => Some("nothing pending"),
+        }
+    }
+
+    /// When unconfirmed keys time out: the server has to confirm something
+    /// within `pending_timeout` of the oldest key being sent or of its last
+    /// confirmation, whichever is later.
+    fn pending_deadline(&self, rtt: Duration) -> Option<Instant> {
+        self.pending
+            .first()
+            .map(|oldest| oldest.sent.max(self.last_progress) + pending_timeout(rtt))
+    }
+
+    /// The next time `expiry_reason` could change its answer.
+    pub fn next_deadline(&self, rtt: Duration) -> Option<Instant> {
+        let mismatch = self.mismatch_since.map(|since| since + mismatch_grace(rtt));
+        match (mismatch, self.pending_deadline(rtt)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
@@ -596,8 +627,33 @@ mod test {
         let mut sim = Sim::new(PROMPT);
         sim.type_str("a");
         let rtt = Duration::from_millis(300);
-        assert!(!sim.pred.expired(sim.now + rtt, rtt));
-        assert!(sim.pred.expired(sim.now + rtt * 2 + PENDING_SLACK, rtt));
+        assert_eq!(pending_timeout(rtt), MIN_PENDING_TIMEOUT);
+        assert_eq!(
+            pending_timeout(Duration::from_secs(1)),
+            Duration::from_millis(2400)
+        );
+        assert!(!sim.pred.expired(sim.now + rtt * 2 + PENDING_SLACK, rtt));
+        assert!(sim.pred.expired(sim.now + MIN_PENDING_TIMEOUT, rtt));
+    }
+
+    #[test]
+    fn confirmations_keep_a_lagging_prediction_alive() {
+        // A lag spike: the server keeps confirming keys, but slowly. As
+        // long as it makes progress the prediction must not be dropped.
+        let mut sim = Sim::new(PROMPT);
+        sim.type_str("abcd");
+        let rtt = Duration::from_millis(400);
+        let later = sim.now + Duration::from_millis(1900);
+        assert!(matches!(
+            sim.pred.on_server_line(&line("h:~% a"), 6, later),
+            Outcome::Keep
+        ));
+        assert!(!sim.pred.expired(sim.now + Duration::from_millis(3000), rtt));
+        assert!(sim.pred.expired(later + MIN_PENDING_TIMEOUT, rtt));
+        assert_eq!(
+            sim.pred.next_deadline(rtt),
+            Some(later + MIN_PENDING_TIMEOUT)
+        );
     }
 
     #[test]

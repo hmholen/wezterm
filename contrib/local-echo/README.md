@@ -50,6 +50,10 @@ python3 -I contrib/local-echo/e2e/score.py /dev/shm/wt-*/log.txt
   Uses `/usr/bin/wezterm-mux-server` and your login zsh (with its plugins).
   The `claude` scenario starts Claude Code in `$HOME` and accepts its
   one-session trust prompt; it never submits a prompt.
+- Relay options (environment): `LAG_JITTER_MS=<ms>` adds random per-chunk
+  delay so updates arrive in bursts; `LAG_STALL=<start>:<seconds>` freezes
+  server-to-client traffic once, like a lag spike (around `14.9:1.6` lands
+  in the `hold` scenario's typing).
 - `score.py`: counts display changes more than 20 ms after the last key
   press, i.e. changes the user did not cause. At 400 ms: stock 53 (shell) /
   29 (Claude Code typing phases); patched 6 (only Enter and Ctrl+U results)

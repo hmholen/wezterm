@@ -333,6 +333,11 @@ impl Pane for ClientPane {
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
+        log::trace!(
+            target: "wezterm_client::pane::predict",
+            "send paste of {} chars",
+            text.chars().count()
+        );
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         self.renderable
@@ -457,6 +462,12 @@ impl Pane for ClientPane {
             let mut inner = renderable.inner.borrow_mut();
             inner.input_serial = InputSerial::now();
             input_serial = inner.input_serial;
+            log::trace!(
+                target: "wezterm_client::pane::predict",
+                "send key {:?} mods={:?}",
+                key,
+                mods
+            );
             inner.predict_from_key_event(key, mods);
         }
         let client = Arc::clone(&self.client);
@@ -650,6 +661,14 @@ struct PaneWriter {
 
 impl std::io::Write for PaneWriter {
     fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
+        // Raw writes bypass local echo prediction; trace them alongside the
+        // keys so that a mismatch between what was predicted and what the
+        // server received can be told apart from a lost key.
+        log::trace!(
+            target: "wezterm_client::pane::predict",
+            "send raw write of {} bytes",
+            data.len()
+        );
         promise::spawn::block_on(self.client.client.write_to_pane(WriteToPane {
             pane_id: self.remote_pane_id,
             data: data.to_vec(),

@@ -5,7 +5,7 @@ GUI=$1; LAG=$2; LABEL=$3
 E=$(cd "$(dirname "$0")" && pwd)
 RUN=/dev/shm/wt-$LABEL
 rm -rf "$RUN"; mkdir -p "$RUN/xdg"; chmod 700 "$RUN" "$RUN/xdg"
-export LAG_TRACE=$RUN/trace.txt XDG_RUNTIME_DIR=$RUN/xdg TEST_SOCK=$RUN/sock LAGPROXY=$E/lagproxy.py LAG_MS=$LAG LAG_JITTER_MS=${LAG_JITTER_MS:-0} \
+export LAG_TRACE=$RUN/trace.txt XDG_RUNTIME_DIR=$RUN/xdg TEST_SOCK=$RUN/sock LAGPROXY=$E/lagproxy.py LAG_MS=$LAG LAG_JITTER_MS=${LAG_JITTER_MS:-0} LAG_STALL=${LAG_STALL:-} \
        SERVER_CFG=$E/server.lua TEST_LOG=$RUN/log.txt
 unset WEZTERM_UNIX_SOCKET WEZTERM_PANE TMUX TMUX_PANE
 if ! pgrep -f "Xvnc :77" >/dev/null; then

@@ -1,6 +1,6 @@
 use crate::domain::ClientInner;
 use crate::pane::clientpane::ClientPane;
-use crate::pane::predict::{self, Outcome, PredKey, Predictor, PENDING_SLACK};
+use crate::pane::predict::{self, Outcome, PredKey, Predictor};
 use anyhow::anyhow;
 use codec::*;
 use config::{configuration, ConfigHandle};
@@ -88,6 +88,8 @@ pub struct RenderableInner {
     /// Leftmost column the server cursor has been seen at, per row: where
     /// user input starts on that row (just after the prompt).
     input_starts: HashMap<StableRowIndex, usize>,
+    /// When the earliest pending prediction timer fires.
+    prediction_check_at: Option<Instant>,
 }
 
 pub struct RenderableState {
@@ -130,6 +132,7 @@ impl RenderableInner {
             predictor: None,
             server_cursor: StableCursorPosition::default(),
             input_starts: HashMap::new(),
+            prediction_check_at: None,
         }
     }
 
@@ -201,17 +204,40 @@ impl RenderableInner {
         }
     }
 
-    fn schedule_prediction_check(&self, delay: Duration) {
+    /// A prediction timer fired: expire the prediction if it is due, and
+    /// arrange to check again at its next deadline otherwise.
+    fn on_prediction_timer(&mut self, deadline: Instant) -> bool {
+        if self.prediction_check_at == Some(deadline) {
+            self.prediction_check_at = None;
+        }
+        let expired = self.expire_prediction();
+        let rtt = self.prediction_rtt();
+        if let Some(next) = self.predictor.as_ref().and_then(|p| p.next_deadline(rtt)) {
+            self.schedule_prediction_check(next.saturating_duration_since(Instant::now()));
+        }
+        expired
+    }
+
+    /// Make sure a prediction timer fires within `delay`. Only the earliest
+    /// timer is kept track of; it reschedules itself as needed.
+    fn schedule_prediction_check(&mut self, delay: Duration) {
+        let deadline = Instant::now() + delay;
+        if let Some(at) = self.prediction_check_at {
+            if at <= deadline {
+                return;
+            }
+        }
+        self.prediction_check_at = Some(deadline);
         let local_pane_id = self.local_pane_id;
         promise::spawn::spawn(async move {
-            smol::Timer::after(delay + Duration::from_millis(1)).await;
+            smol::Timer::at(deadline + Duration::from_millis(1)).await;
             let mux = Mux::get();
             if let Some(pane) = mux.get_pane(local_pane_id) {
                 if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
                     let expired = {
                         let renderable = client_pane.renderable.lock();
                         let mut inner = renderable.inner.borrow_mut();
-                        inner.expire_prediction()
+                        inner.on_prediction_timer(deadline)
                     };
                     if expired {
                         mux.notify(mux::MuxNotification::PaneOutput(local_pane_id));
@@ -325,7 +351,7 @@ impl RenderableInner {
         match pred_key {
             Some(key) if self.should_predict() => {
                 if self.predict_key(key) {
-                    self.schedule_prediction_check(self.prediction_rtt() * 2 + PENDING_SLACK);
+                    self.schedule_prediction_check(predict::pending_timeout(self.prediction_rtt()));
                 }
             }
             _ => self.prediction_barrier(),
@@ -348,7 +374,7 @@ impl RenderableInner {
             predicted = true;
         }
         if predicted {
-            self.schedule_prediction_check(self.prediction_rtt() * 2 + PENDING_SLACK);
+            self.schedule_prediction_check(predict::pending_timeout(self.prediction_rtt()));
         }
     }
 
