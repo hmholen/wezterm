@@ -1,5 +1,6 @@
 use crate::domain::ClientInner;
 use crate::pane::clientpane::ClientPane;
+use crate::pane::predict::{self, Outcome, PredKey, Predictor, MISMATCH_GRACE, PENDING_SLACK};
 use anyhow::anyhow;
 use codec::*;
 use config::{configuration, ConfigHandle};
@@ -17,10 +18,10 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use termwiz::cell::{Cell, CellAttributes, Underline};
+use termwiz::cell::CellAttributes;
 use termwiz::color::AnsiColor;
 use termwiz::image::{ImageCell, ImageData};
-use termwiz::surface::{SequenceNo, SEQ_ZERO};
+use termwiz::surface::{CursorVisibility, SequenceNo, SEQ_ZERO};
 use url::Url;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
 
@@ -78,6 +79,16 @@ pub struct RenderableInner {
     last_input_rtt: u64,
 
     pub input_serial: InputSerial,
+
+    /// Local echo that has not been confirmed by the server yet.
+    predictor: Option<Predictor>,
+    /// The cursor as the server last reported it; `cursor_position` is
+    /// what we display, which runs ahead of it while predicting.
+    server_cursor: StableCursorPosition,
+    /// Row the server cursor is on, and the leftmost column it has been
+    /// seen at on that row: where user input starts (after the prompt).
+    input_row: StableRowIndex,
+    input_start_x: usize,
 }
 
 pub struct RenderableState {
@@ -117,6 +128,10 @@ impl RenderableInner {
             last_input_rtt: 0,
             input_serial: InputSerial::empty(),
             seqno: SEQ_ZERO,
+            predictor: None,
+            server_cursor: StableCursorPosition::default(),
+            input_row: 0,
+            input_start_x: 0,
         }
     }
 
@@ -142,67 +157,146 @@ impl RenderableInner {
             .unwrap_or(false)
     }
 
-    /// Compute a "prediction" and apply it to the line data that we
-    /// have available, marking it as dirty so that it gets rendered.
-    /// The prediction is basically just local echo.
-    /// Open questions:
-    /// how do we tell if the intent is to suppress local echo during eg:
-    ///  * password prompt?  One option is to look back and see if the line
-    ///                      looks like a password prompt.
-    ///  * normal mode in vim: letter presses are typically movement or
-    ///                        other editor commands
-    /// There are bound to be a number of other edge cases that we should
-    /// handle.
-    fn apply_prediction(&mut self, c: KeyCode, line: &mut Line) {
-        let text = line.as_str();
-        if text.contains("sword") {
-            // This line might be a password prompt.  Don't force
-            // on local echo here, as we don't want to reveal content
-            // from their password
-            return;
-        }
+    fn prediction_rtt(&self) -> Duration {
+        Duration::from_millis(self.last_input_rtt)
+    }
 
-        match c {
-            KeyCode::Enter => {
-                self.cursor_position.x = 0;
-                self.cursor_position.y += 1;
-            }
-            KeyCode::UpArrow => {
-                self.cursor_position.y = self.cursor_position.y.saturating_sub(1);
-            }
-            KeyCode::DownArrow => {
-                self.cursor_position.y += 1;
-            }
-            KeyCode::RightArrow => {
-                self.cursor_position.x += 1;
-            }
-            KeyCode::LeftArrow => {
-                self.cursor_position.x = self.cursor_position.x.saturating_sub(1);
-            }
-            KeyCode::Delete => {
-                line.erase_cell(self.cursor_position.x, SEQ_ZERO);
-            }
-            KeyCode::Backspace => {
-                if self.cursor_position.x > 0 {
-                    line.erase_cell(self.cursor_position.x - 1, SEQ_ZERO);
-                    self.cursor_position.x -= 1;
+    /// An input we cannot model was sent: stop predicting until the server
+    /// has caught up with it.
+    fn prediction_barrier(&mut self) {
+        if let Some(pred) = self.predictor.as_mut() {
+            pred.barrier = true;
+        }
+    }
+
+    /// Abandon the prediction and show the most recent server state.
+    fn clear_prediction(&mut self) {
+        if let Some(pred) = self.predictor.take() {
+            self.lines.put(pred.row, LineEntry::Line(pred.server_line));
+            self.cursor_position = self.server_cursor;
+        }
+    }
+
+    /// Called from a timer: abandon a prediction that the server has not
+    /// confirmed in time. Returns true if the display changed.
+    fn expire_prediction(&mut self) -> bool {
+        let rtt = self.prediction_rtt();
+        let expired = self
+            .predictor
+            .as_ref()
+            .map(|pred| pred.expired(Instant::now(), rtt))
+            .unwrap_or(false);
+        if expired {
+            log::trace!("prediction expired for local={}", self.local_pane_id);
+            self.clear_prediction();
+        }
+        expired
+    }
+
+    fn schedule_prediction_check(&self, delay: Duration) {
+        let local_pane_id = self.local_pane_id;
+        promise::spawn::spawn(async move {
+            smol::Timer::after(delay + Duration::from_millis(1)).await;
+            let mux = Mux::get();
+            if let Some(pane) = mux.get_pane(local_pane_id) {
+                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                    let expired = {
+                        let renderable = client_pane.renderable.lock();
+                        let mut inner = renderable.inner.borrow_mut();
+                        inner.expire_prediction()
+                    };
+                    if expired {
+                        mux.notify(mux::MuxNotification::PaneOutput(local_pane_id));
+                    }
                 }
             }
-            KeyCode::Char(c) => {
-                let cell = Cell::new(
-                    c,
-                    CellAttributes::default()
-                        .set_underline(Underline::Double)
-                        .clone(),
-                );
+        })
+        .detach();
+    }
 
-                let width = cell.width();
-                line.set_cell(self.cursor_position.x, cell, SEQ_ZERO);
-                // Adjust the cursor to reflect the width of this new cell
-                self.cursor_position.x += width;
-            }
-            _ => {}
+    /// Draw the predicted effect of `key` into the cursor line. Returns
+    /// false if the key cannot be predicted, which also stops prediction
+    /// until the server catches up.
+    fn predict_key(&mut self, key: PredKey) -> bool {
+        let row = self.cursor_position.y;
+        let cols = self.dimensions.cols;
+        let x = self.cursor_position.x;
+
+        if self.cursor_position.visibility != CursorVisibility::Visible {
+            // Full screen applications that hide the cursor draw their
+            // own; we would be predicting into the wrong place.
+            self.prediction_barrier();
+            return false;
         }
+        if let Some(pred) = &self.predictor {
+            if pred.row != row || !pred.can_predict(key, x, cols) {
+                self.prediction_barrier();
+                return false;
+            }
+        }
+
+        let (mut line, fetching) = match self.lines.pop(&row) {
+            Some(LineEntry::Line(line)) | Some(LineEntry::Stale(line)) => (line, None),
+            Some(LineEntry::LineAndFetching(line, since)) => (line, Some(since)),
+            Some(entry) => {
+                self.lines.put(row, entry);
+                self.prediction_barrier();
+                return false;
+            }
+            None => {
+                self.prediction_barrier();
+                return false;
+            }
+        };
+
+        let input_start_x = match &self.predictor {
+            Some(pred) => pred.input_start_x,
+            None if self.input_row == row => self.input_start_x.min(x),
+            None => x,
+        };
+
+        // Don't echo after what looks like a prompt for a secret.
+        // Applications that read one do not echo it, so a prediction would
+        // show the secret until it expires. Only the prompt is checked, not
+        // what the user typed after it.
+        let prompt = predict::EditState::capture(&line, input_start_x)
+            .text
+            .to_lowercase();
+        let mut ok = ![
+            "password",
+            "passwd",
+            "passphrase",
+            "passcode",
+            "pin:",
+            "pin for",
+            "token:",
+            "secret",
+        ]
+        .iter()
+        .any(|word| prompt.contains(word));
+        if ok && self.predictor.is_none() {
+            let pred = Predictor::new(row, &line, x, input_start_x);
+            ok = pred.can_predict(key, x, cols);
+            if ok {
+                self.predictor = Some(pred);
+            }
+        }
+
+        if ok {
+            let pred = self.predictor.as_mut().expect("predictor was just ensured");
+            let mut new_x = x;
+            pred.push(key, &mut line, &mut new_x, cols, Instant::now());
+            self.cursor_position.x = new_x;
+        } else {
+            self.prediction_barrier();
+        }
+
+        let entry = match fetching {
+            Some(since) => LineEntry::LineAndFetching(line, since),
+            None => LineEntry::Line(line),
+        };
+        self.lines.put(row, entry);
+        ok
     }
 
     /// Based on a keypress, apply a "prediction" of what the terminal
@@ -210,91 +304,45 @@ impl RenderableInner {
     /// remote system.  The prediction helps to reduce perceived latency
     /// when a user is typing at any reasonable velocity.
     pub fn predict_from_key_event(&mut self, key: KeyCode, mods: KeyModifiers) {
-        if !self.should_predict() {
+        if key.is_modifier() {
             return;
         }
-
-        let c = match key {
-            KeyCode::LeftArrow
-            | KeyCode::RightArrow
-            | KeyCode::UpArrow
-            | KeyCode::DownArrow
-            | KeyCode::Delete
-            | KeyCode::Backspace
-            | KeyCode::Enter
-            | KeyCode::Char(_) => key,
-            _ => return,
+        let mods = mods.remove_positional_mods();
+        let plain = mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT;
+        let pred_key = match key {
+            KeyCode::Char(c) if plain && predict::is_simple_char(c) => Some(PredKey::Char(c)),
+            KeyCode::Backspace if mods == KeyModifiers::NONE => Some(PredKey::Backspace),
+            KeyCode::LeftArrow if mods == KeyModifiers::NONE => Some(PredKey::Left),
+            _ => None,
         };
-        if mods != KeyModifiers::NONE && mods != KeyModifiers::SHIFT {
-            return;
-        }
-
-        let row = self.cursor_position.y;
-        match self.lines.pop(&row) {
-            Some(LineEntry::Stale(mut line)) | Some(LineEntry::Line(mut line)) => {
-                self.apply_prediction(c, &mut line);
-                self.lines.put(row, LineEntry::Line(line));
+        match pred_key {
+            Some(key) if self.should_predict() => {
+                if self.predict_key(key) {
+                    self.schedule_prediction_check(self.prediction_rtt() * 2 + PENDING_SLACK);
+                }
             }
-            Some(LineEntry::LineAndFetching(mut line, instant)) => {
-                self.apply_prediction(c, &mut line);
-                self.lines
-                    .put(row, LineEntry::LineAndFetching(line, instant));
-            }
-            Some(entry) => {
-                self.lines.put(row, entry);
-            }
-            None => {}
-        }
-    }
-
-    fn apply_paste_prediction(&mut self, row: usize, text: &str, line: &mut Line) {
-        let attrs = CellAttributes::default()
-            .set_underline(Underline::Double)
-            .clone();
-
-        let text_line = Line::from_text(text, &attrs, SEQ_ZERO, None);
-
-        if row == 0 {
-            for cell in text_line.visible_cells() {
-                line.set_cell(self.cursor_position.x, cell.as_cell(), SEQ_ZERO);
-                self.cursor_position.x += cell.width();
-            }
-        } else {
-            // The pasted line replaces the data for the existing line
-            line.resize_and_clear(0, SEQ_ZERO, CellAttributes::default());
-            line.append_line(text_line, SEQ_ZERO);
-            self.cursor_position.x = line.len();
+            _ => self.prediction_barrier(),
         }
     }
 
     pub fn predict_from_paste(&mut self, text: &str) {
-        if !self.should_predict() {
+        let simple = !text.is_empty()
+            && text.chars().count() <= self.dimensions.cols
+            && text.chars().all(predict::is_simple_char);
+        if !simple || !self.should_predict() {
+            self.prediction_barrier();
             return;
         }
-
-        let text = textwrap::fill(text, self.dimensions.cols);
-        let lines: Vec<&str> = text.split("\n").collect();
-
-        for (idx, paste_line) in lines.iter().enumerate() {
-            let row = self.cursor_position.y + idx as StableRowIndex;
-
-            match self.lines.pop(&row) {
-                Some(LineEntry::Stale(mut line)) | Some(LineEntry::Line(mut line)) => {
-                    self.apply_paste_prediction(idx, paste_line, &mut line);
-                    self.lines.put(row, LineEntry::Line(line));
-                }
-                Some(LineEntry::LineAndFetching(mut line, instant)) => {
-                    self.apply_paste_prediction(idx, paste_line, &mut line);
-                    self.lines
-                        .put(row, LineEntry::LineAndFetching(line, instant));
-                }
-                Some(entry) => {
-                    self.lines.put(row, entry);
-                }
-                None => {}
+        let mut predicted = false;
+        for c in text.chars() {
+            if !self.predict_key(PredKey::Char(c)) {
+                break;
             }
+            predicted = true;
         }
-        self.cursor_position.y += lines.len().saturating_sub(1) as StableRowIndex;
+        if predicted {
+            self.schedule_prediction_check(self.prediction_rtt() * 2 + PENDING_SLACK);
+        }
     }
 
     pub fn update_last_send(&mut self) {
@@ -344,8 +392,28 @@ impl RenderableInner {
         // finally right one in quick succession.
         // If the delta was not from an input event then we trust it; this is most
         // like due to a unilateral movement by the application on the other end.
-        if delta.input_serial.is_none()
-            || delta.input_serial.unwrap_or(InputSerial::empty()) >= self.input_serial
+        self.server_cursor = delta.cursor_position;
+        if delta.cursor_position.y != self.input_row {
+            self.input_row = delta.cursor_position.y;
+            self.input_start_x = delta.cursor_position.x;
+        } else {
+            self.input_start_x = self.input_start_x.min(delta.cursor_position.x);
+        }
+
+        // A prediction is only meaningful while the server cursor is still
+        // on the row we predicted into; otherwise the input was submitted or
+        // output arrived, so show the server's view.
+        if let Some(pred) = &self.predictor {
+            if pred.row != delta.cursor_position.y || delta.dimensions.cols != self.dimensions.cols
+            {
+                self.clear_prediction();
+            }
+        }
+        let was_predicting = self.predictor.is_some();
+
+        if !was_predicting
+            && (delta.input_serial.is_none()
+                || delta.input_serial.unwrap_or(InputSerial::empty()) >= self.input_serial)
         {
             self.cursor_position = delta.cursor_position;
         }
@@ -363,8 +431,39 @@ impl RenderableInner {
         let config = configuration();
         for (stable_row, line) in bonus_lines {
             log::trace!("bonus line {} seqno={}", stable_row, line.current_seqno());
-            self.put_line(stable_row, line, &config, None);
+            let line = match self.predictor.as_mut() {
+                Some(pred) if pred.row == stable_row => {
+                    match pred.on_server_line(&line, delta.cursor_position.x, now) {
+                        Outcome::Done => {
+                            self.predictor = None;
+                            Some(line)
+                        }
+                        // Keep showing the prediction.
+                        Outcome::Keep => None,
+                        Outcome::Hold => {
+                            self.schedule_prediction_check(MISMATCH_GRACE);
+                            None
+                        }
+                    }
+                }
+                _ => Some(line),
+            };
+            if let Some(line) = line {
+                self.put_line(stable_row, line, &config, None);
+            }
             dirty.remove(stable_row);
+        }
+
+        match &self.predictor {
+            Some(pred) => {
+                self.cursor_position = StableCursorPosition {
+                    x: pred.predicted_cursor_x(),
+                    y: pred.row,
+                    ..delta.cursor_position
+                };
+            }
+            None if was_predicting => self.cursor_position = delta.cursor_position,
+            None => {}
         }
 
         log::trace!(
@@ -423,6 +522,7 @@ impl RenderableInner {
     }
 
     pub fn make_all_stale(&mut self) {
+        self.predictor = None;
         let mut lines = LruCache::unbounded();
         while let Some((stable_row, entry)) = self.lines.pop_lru() {
             let entry = match entry {
@@ -453,6 +553,26 @@ impl RenderableInner {
         fetch_start: Option<Instant>,
     ) {
         line.scan_and_create_hyperlinks(&config.hyperlink_rules);
+
+        if fetch_start.is_some() && self.predictor.as_ref().map(|p| p.row) == Some(stable_row) {
+            // Keep showing the prediction for this row; the cursor line
+            // that comes with every server update drives reconciliation.
+            match self.lines.pop(&stable_row) {
+                Some(LineEntry::LineAndFetching(old, _)) => {
+                    self.lines.put(stable_row, LineEntry::Line(old));
+                    return;
+                }
+                Some(LineEntry::Fetching(then)) => {
+                    // Nothing to keep; fall through and take the server copy.
+                    self.lines.put(stable_row, LineEntry::Fetching(then));
+                }
+                Some(e) => {
+                    self.lines.put(stable_row, e);
+                    return;
+                }
+                None => return,
+            }
+        }
 
         let entry = if let Some(fetch_start) = fetch_start {
             // If we're completing a fetch, only replace entries that were
