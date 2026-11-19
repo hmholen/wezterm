@@ -147,15 +147,21 @@ pub fn apply_key(
             }
             *cursor_x += 1;
         }
+        // At the start of the input these do nothing in shells and agent
+        // prompts; predicting that (rather than refusing to predict) keeps
+        // a held-down Backspace that overshoots from pausing prediction for
+        // whatever is typed next.
         PredKey::Backspace => {
-            if *cursor_x > 0 {
+            if *cursor_x > input_start_x {
                 line.erase_cell(*cursor_x - 1, SEQ_ZERO);
                 *cursor_x -= 1;
                 clear_ghost_text(line, *cursor_x);
             }
         }
         PredKey::Left => {
-            *cursor_x = cursor_x.saturating_sub(1);
+            if *cursor_x > input_start_x {
+                *cursor_x -= 1;
+            }
         }
     }
 }
@@ -225,7 +231,7 @@ impl Predictor {
         match key {
             PredKey::Char(c) => is_simple_char(c) && cursor_x + 1 < cols,
             // Never predict deleting or moving into the prompt.
-            PredKey::Backspace | PredKey::Left => cursor_x > self.input_start_x,
+            PredKey::Backspace | PredKey::Left => true,
         }
     }
 
@@ -297,9 +303,33 @@ impl Predictor {
         outcome
     }
 
+    /// The server reports its cursor on `server_row`, not on our row.
+    pub fn on_server_cursor_elsewhere(
+        &mut self,
+        server_row: StableRowIndex,
+        now: Instant,
+    ) -> Outcome {
+        let outcome = if self.barrier {
+            Outcome::Done
+        } else {
+            self.mismatch_since.get_or_insert(now);
+            Outcome::Hold
+        };
+        log::trace!(
+            "server cursor on row {} instead of {} -> {:?}{}; history {}",
+            server_row,
+            self.row,
+            outcome,
+            if self.barrier { " (barrier)" } else { "" },
+            self.describe_history()
+        );
+        outcome
+    }
+
     /// `base` and the state after each pending key, for logging.
     pub fn describe_history(&self) -> String {
-        let mut out = self.base.describe();
+        let mut out = format!("[input from x={}] ", self.input_start_x);
+        out.push_str(&self.base.describe());
         for p in &self.pending {
             out.push_str(" > ");
             out.push_str(&p.after.describe());
@@ -585,10 +615,47 @@ mod test {
     #[test]
     fn does_not_delete_into_the_prompt() {
         let mut sim = Sim::new("h:~% ab");
-        assert!(sim.key(PredKey::Backspace));
-        assert!(sim.key(PredKey::Backspace));
-        assert!(!sim.key(PredKey::Backspace), "would eat the prompt");
+        for _ in 0..4 {
+            assert!(sim.key(PredKey::Backspace));
+        }
+        assert!(sim.key(PredKey::Left));
         assert_eq!(sim.shown(), (PROMPT.trim_end().to_string(), 5));
+        assert!(!sim.pred.barrier);
+    }
+
+    #[test]
+    fn typing_right_after_overshooting_backspace_is_predicted() {
+        // Held-down Backspace repeats past the start of the input, then the
+        // user types; the server catches up through all of it.
+        let mut sim = Sim::new("h:~% ab");
+        for _ in 0..5 {
+            assert!(sim.key(PredKey::Backspace));
+        }
+        sim.type_str("hi");
+        let want = ("h:~% hi".to_string(), 7);
+        assert_eq!(sim.shown(), want);
+        for (server, x) in [("h:~% a", 6), ("h:~%", 5), ("h:~%", 5), ("h:~% h", 6)] {
+            assert!(sim.server(server, x));
+            assert_eq!(sim.shown(), want, "server at {:?}", server);
+        }
+        assert!(!sim.server("h:~% hi", 7));
+    }
+
+    #[test]
+    fn cursor_briefly_on_another_row_is_held() {
+        let mut sim = Sim::new(PROMPT);
+        sim.type_str("abc");
+        assert!(matches!(
+            sim.pred.on_server_cursor_elsewhere(1, sim.now),
+            Outcome::Hold
+        ));
+        assert!(sim.server("h:~% ab", 7), "back on the row: still on track");
+        assert!(sim.pred.mismatch_since.is_none());
+        sim.pred.barrier = true; // Enter: now a row change is final
+        assert!(matches!(
+            sim.pred.on_server_cursor_elsewhere(1, sim.now),
+            Outcome::Done
+        ));
     }
 
     #[test]

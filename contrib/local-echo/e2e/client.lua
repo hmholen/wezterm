@@ -88,6 +88,19 @@ local function start()
     { 2.0, function() sampling = true; sample(pane) end },
     { 0.3, set_phase('type') },
   }
+  if E('SCENARIO') == 'hold' then
+    -- held-down Backspace that overshoots the start of the input, then
+    -- typing straight away
+    type_str(steps, 'is this working')
+    table.insert(steps, { 2.5, set_phase('hold') })
+    for _ = 1, 20 do table.insert(steps, { 0.03, key('Backspace') }) end
+    type_str(steps, 'here we go')
+    table.insert(steps, { 3, set_phase('done') })
+    table.insert(steps, { 0.3, key('u', 'CTRL') })
+    table.insert(steps, { 1, function(w, p) log('END'); w:perform_action(act.QuitApplication, p) end })
+    run(window, pane, steps)
+    return
+  end
   if E('SCENARIO') == 'secret' then
     type_str(steps, "read -s '?Password: ' x")
     table.insert(steps, { GAP, key('Enter') })

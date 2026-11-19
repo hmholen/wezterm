@@ -85,10 +85,9 @@ pub struct RenderableInner {
     /// The cursor as the server last reported it; `cursor_position` is
     /// what we display, which runs ahead of it while predicting.
     server_cursor: StableCursorPosition,
-    /// Row the server cursor is on, and the leftmost column it has been
-    /// seen at on that row: where user input starts (after the prompt).
-    input_row: StableRowIndex,
-    input_start_x: usize,
+    /// Leftmost column the server cursor has been seen at, per row: where
+    /// user input starts on that row (just after the prompt).
+    input_starts: HashMap<StableRowIndex, usize>,
 }
 
 pub struct RenderableState {
@@ -130,8 +129,7 @@ impl RenderableInner {
             seqno: SEQ_ZERO,
             predictor: None,
             server_cursor: StableCursorPosition::default(),
-            input_row: 0,
-            input_start_x: 0,
+            input_starts: HashMap::new(),
         }
     }
 
@@ -261,8 +259,7 @@ impl RenderableInner {
 
         let input_start_x = match &self.predictor {
             Some(pred) => pred.input_start_x,
-            None if self.input_row == row => self.input_start_x.min(x),
-            None => x,
+            None => self.input_starts.get(&row).map_or(x, |&start| start.min(x)),
         };
 
         // Don't echo after what looks like a prompt for a secret.
@@ -403,22 +400,44 @@ impl RenderableInner {
         // If the delta was not from an input event then we trust it; this is most
         // like due to a unilateral movement by the application on the other end.
         self.server_cursor = delta.cursor_position;
-        if delta.cursor_position.y != self.input_row {
-            self.input_row = delta.cursor_position.y;
-            self.input_start_x = delta.cursor_position.x;
-        } else {
-            self.input_start_x = self.input_start_x.min(delta.cursor_position.x);
+        // Learn where input starts on a row (just after the prompt) from
+        // the snapshots the server takes as each key arrives: the
+        // application is then idle, waiting for input. Other snapshots can
+        // catch it half way through drawing the prompt, with the cursor at
+        // column 0, which would let a held-down Backspace eat the prompt.
+        if delta.input_serial.is_some() {
+            if self.input_starts.len() > 1024 {
+                self.input_starts.clear();
+            }
+            let cursor = delta.cursor_position;
+            self.input_starts
+                .entry(cursor.y)
+                .and_modify(|start| *start = (*start).min(cursor.x))
+                .or_insert(cursor.x);
         }
 
-        // A prediction is only meaningful while the server cursor is still
-        // on the row we predicted into; otherwise the input was submitted or
-        // output arrived, so show the server's view.
-        if let Some(pred) = &self.predictor {
-            if pred.row != delta.cursor_position.y || delta.dimensions.cols != self.dimensions.cols
-            {
+        // Predictions are reconciled against the server's cursor line. If
+        // the server cursor is on another row, the input was submitted or
+        // output arrived; or the snapshot caught the application half way
+        // through a redraw, which the next update corrects.
+        let server_cursor_elsewhere = match self.predictor.as_mut() {
+            Some(_) if delta.dimensions.cols != self.dimensions.cols => {
                 self.clear_prediction();
+                false
             }
-        }
+            Some(pred) if pred.row != delta.cursor_position.y => {
+                match pred.on_server_cursor_elsewhere(delta.cursor_position.y, now) {
+                    Outcome::Hold => {
+                        self.schedule_prediction_check(predict::mismatch_grace(
+                            self.prediction_rtt(),
+                        ));
+                    }
+                    _ => self.clear_prediction(),
+                }
+                true
+            }
+            _ => false,
+        };
         let was_predicting = self.predictor.is_some();
 
         if !was_predicting
@@ -442,6 +461,12 @@ impl RenderableInner {
         for (stable_row, line) in bonus_lines {
             log::trace!("bonus line {} seqno={}", stable_row, line.current_seqno());
             let line = match self.predictor.as_mut() {
+                Some(pred) if pred.row == stable_row && server_cursor_elsewhere => {
+                    // Not comparable without the cursor; remember it in case
+                    // we give up, but keep showing the prediction.
+                    pred.server_line = line;
+                    None
+                }
                 Some(pred) if pred.row == stable_row => {
                     match pred.on_server_line(&line, delta.cursor_position.x, now) {
                         Outcome::Done => {
