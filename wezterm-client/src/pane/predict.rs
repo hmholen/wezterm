@@ -25,6 +25,7 @@
 //! used for display at all: replaying the pending keys on top of them would
 //! drag a stale autosuggestion around.
 
+use codec::InputSerial;
 use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, Intensity};
 use termwiz::color::ColorAttribute;
@@ -187,6 +188,8 @@ pub fn apply_key(
 pub struct Pending {
     pub after: EditState,
     pub sent: Instant,
+    /// Input serial of the key (pasted characters have none).
+    pub serial: Option<InputSerial>,
 }
 
 /// What to do with a server copy of the predicted row.
@@ -263,37 +266,58 @@ impl Predictor {
         cursor_x: &mut usize,
         cols: usize,
         now: Instant,
+        serial: Option<InputSerial>,
     ) {
         apply_key(line, cursor_x, key, self.input_start_x, cols);
         self.pending.push(Pending {
             after: EditState::capture(line, *cursor_x),
             sent: now,
+            serial,
         });
     }
 
     /// Reconcile with a fresh server copy of `self.row`, given the server's
-    /// cursor column on that row.
-    pub fn on_server_line(&mut self, line: &Line, server_cursor_x: usize, now: Instant) -> Outcome {
+    /// cursor column on that row and the newest input serial the server has
+    /// acknowledged.
+    ///
+    /// The same edit state can occur more than once in the history (typing
+    /// "o" then Backspace returns to an earlier state), so a match alone
+    /// does not say how far the server has got. Taking the server to be
+    /// done when it is merely passing through an identical earlier state
+    /// loses track of keys still in flight, and later predictions then
+    /// start from the wrong place. The acknowledged serial resolves it: the
+    /// server's snapshot for a key is taken as that key arrives, so every
+    /// key sent before it has been applied, and the state cannot be an
+    /// earlier one. Among the remaining matches the earliest wins, since
+    /// the server passes through our states in order.
+    pub fn on_server_line(
+        &mut self,
+        line: &Line,
+        server_cursor_x: usize,
+        now: Instant,
+        acked: InputSerial,
+    ) -> Outcome {
         self.server_line = line.clone();
         let state = EditState::capture(line, server_cursor_x);
 
-        let caught_up = match self.pending.last() {
-            None => true,
-            Some(last) => last.after == state,
-        };
-
-        // Otherwise the server is behind: find how far it has got. Earliest
-        // match wins, since the server passes through our states in order.
-        let confirmed = if caught_up {
-            None
-        } else if self.base == state {
-            Some(0)
-        } else {
-            self.pending
-                .iter()
-                .position(|p| p.after == state)
-                .map(|idx| idx + 1)
-        };
+        // Index i is the state after the first i pending keys (0: base).
+        let candidates: Vec<usize> = std::iter::once(&self.base)
+            .chain(self.pending.iter().map(|p| &p.after))
+            .enumerate()
+            .filter(|(_, s)| **s == state)
+            .map(|(i, _)| i)
+            .collect();
+        let applied_at_least = self
+            .pending
+            .iter()
+            .rposition(|p| p.serial.map_or(false, |serial| serial < acked))
+            .map_or(0, |idx| idx + 1);
+        let confirmed = candidates
+            .iter()
+            .copied()
+            .find(|&i| i >= applied_at_least)
+            .or_else(|| candidates.last().copied());
+        let caught_up = confirmed == Some(self.pending.len());
 
         let outcome = match confirmed {
             _ if caught_up => Outcome::Done,
@@ -419,6 +443,14 @@ mod test {
         display: Line,
         cursor_x: usize,
         now: Instant,
+        /// Serial given to the next key.
+        next_serial: u64,
+        /// Newest serial the server has acknowledged.
+        acked: InputSerial,
+    }
+
+    fn serial(n: u64) -> InputSerial {
+        (std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(1_000_000 + n)).into()
     }
 
     impl Sim {
@@ -430,6 +462,8 @@ mod test {
                 display: l,
                 cursor_x: x,
                 now: Instant::now(),
+                next_serial: 1,
+                acked: InputSerial::empty(),
             }
         }
 
@@ -438,8 +472,16 @@ mod test {
                 self.pred.barrier = true;
                 return false;
             }
-            self.pred
-                .push(key, &mut self.display, &mut self.cursor_x, COLS, self.now);
+            let serial = serial(self.next_serial);
+            self.next_serial += 1;
+            self.pred.push(
+                key,
+                &mut self.display,
+                &mut self.cursor_x,
+                COLS,
+                self.now,
+                Some(serial),
+            );
             true
         }
 
@@ -452,7 +494,7 @@ mod test {
         /// Returns false once the predictor is done.
         fn server(&mut self, server_text: &str, server_x: usize) -> bool {
             let l = line(server_text);
-            match self.pred.on_server_line(&l, server_x, self.now) {
+            match self.pred.on_server_line(&l, server_x, self.now, self.acked) {
                 Outcome::Done => {
                     self.display = l;
                     self.cursor_x = server_x;
@@ -593,7 +635,7 @@ mod test {
         green.set_foreground(termwiz::color::AnsiColor::Green);
         let mut l = line(PROMPT);
         l.append_line(Line::from_text("l", &green, SEQ_ZERO, None), SEQ_ZERO);
-        match sim.pred.on_server_line(&l, 6, sim.now) {
+        match sim.pred.on_server_line(&l, 6, sim.now, sim.acked) {
             Outcome::Keep => {}
             other => panic!("expected keep, got {:?}", other),
         }
@@ -651,7 +693,8 @@ mod test {
         let rtt = Duration::from_millis(400);
         let later = sim.now + Duration::from_millis(1900);
         assert!(matches!(
-            sim.pred.on_server_line(&line("h:~% a"), 6, later),
+            sim.pred
+                .on_server_line(&line("h:~% a"), 6, later, sim.acked),
             Outcome::Keep
         ));
         assert!(!sim.pred.expired(sim.now + Duration::from_millis(3000), rtt));
@@ -743,9 +786,36 @@ mod test {
         sim.type_str("a");
         let want = ("h:~% a".to_string(), 6);
         assert_eq!(sim.shown(), want);
-        // Server reports "a": earliest match keeps the backspace and "a"
-        // pending, which redraws to the same thing.
-        assert!(!sim.server("h:~% a", 6), "newest state matches first");
+        // Server reports "a" with nothing acknowledged yet: it may be the
+        // first "a", so keep the rest pending (the display is the same).
+        assert!(sim.server("h:~% a", 6));
+        assert_eq!(sim.pred.pending.len(), 2);
+        assert_eq!(sim.shown(), want);
+        // Once the last key is acknowledged, "a" must be the final state.
+        sim.acked = serial(3);
+        assert!(!sim.server("h:~% a", 6));
+        assert_eq!(sim.shown(), want);
+    }
+
+    #[test]
+    fn passing_through_a_repeat_of_the_final_state_is_not_done() {
+        // Typing o's then Backspace: the server passes through the same
+        // state on its way up. Taking that for "caught up" loses the keys
+        // still in flight; a later Backspace burst then deletes one too
+        // many characters (the space in "lets ").
+        let mut sim = Sim::new("h:~% lets go");
+        sim.type_str("ooo"); // serials 1..=3, x=13..=15
+        assert!(sim.key(PredKey::Backspace)); // serial 4, back to x=14
+        let want = ("h:~% lets gooo".to_string(), 14);
+        assert_eq!(sim.shown(), want);
+        // Server snapshot as the third "o" arrives: two o's applied, which
+        // looks exactly like the final state.
+        sim.acked = serial(3);
+        assert!(sim.server("h:~% lets gooo", 14), "not caught up yet");
+        assert_eq!(sim.pred.pending.len(), 2);
+        assert!(sim.server("h:~% lets goooo", 15));
+        sim.acked = serial(4);
+        assert!(!sim.server("h:~% lets gooo", 14));
         assert_eq!(sim.shown(), want);
     }
 }

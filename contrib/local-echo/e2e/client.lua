@@ -88,6 +88,22 @@ local function start()
     { 2.0, function() sampling = true; sample(pane) end },
     { 0.3, set_phase('type') },
   }
+  if E('SCENARIO') == 'repeat' then
+    -- states that repeat (o's then Backspace) while the server lags,
+    -- then erase back to "lets " and retype: must end as "lets go"
+    type_str(steps, 'lets go')
+    table.insert(steps, { 2.5, set_phase('repeat') })
+    for _ = 1, 6 do table.insert(steps, { 0.03, key('o') }) end
+    table.insert(steps, { 0.03, key('Backspace') })
+    table.insert(steps, { tonumber(E('REPEAT_PAUSE') or '0.15'), function() end })
+    for _ = 1, 7 do table.insert(steps, { 0.03, key('Backspace') }) end
+    type_str(steps, 'go')
+    table.insert(steps, { 3, set_phase('done') })
+    table.insert(steps, { 0.3, function() end })
+    table.insert(steps, { 0.5, function(w, p) log('END'); w:perform_action(act.QuitApplication, p) end })
+    run(window, pane, steps)
+    return
+  end
   if E('SCENARIO') == 'shiftspace' then
     type_str(steps, 'lets')
     table.insert(steps, { GAP, key('Space', 'SHIFT') })

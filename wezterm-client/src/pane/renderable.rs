@@ -212,7 +212,7 @@ impl RenderableInner {
             }
             _ => return,
         }
-        let keys: Vec<PredKey> = self.deferred.drain(..).map(|(key, _)| key).collect();
+        let keys: Vec<(PredKey, InputSerial)> = self.deferred.drain(..).collect();
         log::trace!(
             target: "wezterm_client::pane::predict",
             "replaying {} deferred keys at x={}",
@@ -222,7 +222,8 @@ impl RenderableInner {
         self.unpredicted = None;
         self.cursor_position = cursor;
         let mut predicted = false;
-        for key in keys {
+        for (key, serial) in keys {
+            self.current_input = Some(serial);
             if !self.predict_key(key) {
                 break;
             }
@@ -420,7 +421,14 @@ impl RenderableInner {
         if ok {
             let pred = self.predictor.as_mut().expect("predictor was just ensured");
             let mut new_x = x;
-            pred.push(key, &mut line, &mut new_x, cols, Instant::now());
+            pred.push(
+                key,
+                &mut line,
+                &mut new_x,
+                cols,
+                Instant::now(),
+                self.current_input,
+            );
             self.cursor_position.x = new_x;
         } else {
             self.prediction_barrier();
@@ -604,6 +612,7 @@ impl RenderableInner {
         self.seqno = delta.seqno;
 
         let config = configuration();
+        let acked = self.acked_serial;
         for (stable_row, line) in bonus_lines {
             log::trace!("bonus line {} seqno={}", stable_row, line.current_seqno());
             let line = match self.predictor.as_mut() {
@@ -614,7 +623,7 @@ impl RenderableInner {
                     None
                 }
                 Some(pred) if pred.row == stable_row => {
-                    match pred.on_server_line(&line, delta.cursor_position.x, now) {
+                    match pred.on_server_line(&line, delta.cursor_position.x, now, acked) {
                         Outcome::Done => {
                             self.predictor = None;
                             Some(line)
