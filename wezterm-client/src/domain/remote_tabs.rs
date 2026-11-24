@@ -470,6 +470,46 @@ impl ClientDomain {
         self.show_in_slot(view_tab_id, remote)
     }
 
+    /// Rename the remote session shown in `view_tab_id` on the server.
+    pub async fn rename_session(&self, view_tab_id: TabId, new_name: String) -> anyhow::Result<()> {
+        let slot = self.slot_for_view(view_tab_id)?;
+        if new_name.is_empty() || new_name == slot.session {
+            return Ok(());
+        }
+        if self.remote_sessions().contains(&new_name) {
+            bail!("there is already a remote session named `{new_name}`");
+        }
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        inner
+            .client
+            .rename_workspace(codec::RenameWorkspace {
+                old_workspace: slot.session.clone(),
+                new_workspace: new_name.clone(),
+            })
+            .await?;
+        self.remote_session_renamed(&slot.session, &new_name);
+        Ok(())
+    }
+
+    /// A remote session was renamed (by us, or by the server telling us).
+    /// In this mode remote sessions are not local workspaces, so only our
+    /// own record of them changes.
+    pub fn remote_session_renamed(&self, old_name: &str, new_name: &str) {
+        let mut state = self.in_tab.lock().unwrap();
+        for info in state.remote_tabs.iter_mut() {
+            if info.workspace == old_name {
+                info.workspace = new_name.to_string();
+            }
+        }
+        for slot in state.slots.iter_mut() {
+            if slot.session == old_name {
+                slot.session = new_name.to_string();
+            }
+        }
+    }
+
     /// Put the local tab back in place of the remote tab `view_tab_id`.
     /// Disconnects when no remote tabs are left.
     pub fn detach_slot(&self, view_tab_id: TabId) -> anyhow::Result<()> {

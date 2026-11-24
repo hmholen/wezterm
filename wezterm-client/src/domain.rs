@@ -288,6 +288,11 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
             old_workspace,
             new_workspace,
         } => {
+            // With remote tabs, local workspaces have nothing to do with
+            // the server's, so a local rename stays local.
+            if client_domain.is_in_tab_mode() {
+                return true;
+            }
             if let Some(inner) = client_domain.inner() {
                 let workspaces = Mux::get().iter_workspaces();
                 if workspaces.contains(&old_workspace) {

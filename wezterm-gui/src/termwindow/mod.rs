@@ -3135,6 +3135,26 @@ impl TermWindow {
                 }
                 None => self.spawn_tab(&config::keyassignment::SpawnTabDomain::CurrentPaneDomain),
             },
+            RenameSession(new_name) => match self.active_remote_tab() {
+                Some((remote, tab_id)) => {
+                    let new_name = new_name.clone();
+                    promise::spawn::spawn(async move {
+                        let client = remote
+                            .downcast_ref::<ClientDomain>()
+                            .expect("active_remote_tab gives a ClientDomain");
+                        if let Err(err) = client.rename_session(tab_id, new_name).await {
+                            log::error!("RenameSession: {err:#}");
+                        }
+                    })
+                    .detach();
+                }
+                None if !new_name.is_empty() => {
+                    let mux = Mux::get();
+                    let old_name = mux.active_workspace();
+                    mux.rename_workspace(&old_name, new_name);
+                }
+                None => {}
+            },
             SwitchToRemoteSession { name } => {
                 if let Some((remote, tab_id)) = self.active_remote_tab() {
                     let name = name.clone();

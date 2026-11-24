@@ -650,6 +650,9 @@ pub enum KeyAssignment {
     SwitchToRemoteSession {
         name: Option<String>,
     },
+    /// Rename the current session: in a remote tab the remote session on
+    /// the server, elsewhere the active local workspace.
+    RenameSession(String),
 
     CopyMode(CopyModeAssignment),
     RotatePanes(RotationDirection),

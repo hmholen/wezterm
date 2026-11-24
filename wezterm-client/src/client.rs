@@ -270,6 +270,19 @@ fn process_unilateral(
             promise::spawn::spawn_into_main_thread(async move {
                 let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
                 log::debug!("got a rename {old_workspace} -> {new_workspace}");
+                if let Some(client_domain) = mux
+                    .get_domain(local_domain_id)
+                    .as_ref()
+                    .and_then(|d| d.downcast_ref::<ClientDomain>())
+                {
+                    if client_domain.is_in_tab_mode() {
+                        // Remote sessions shown in local tabs are not
+                        // local workspaces; don't rename a local one that
+                        // happens to have the same name.
+                        client_domain.remote_session_renamed(&old_workspace, &new_workspace);
+                        return Ok(());
+                    }
+                }
                 mux.rename_workspace(&old_workspace, &new_workspace);
                 anyhow::Result::<()>::Ok(())
             })

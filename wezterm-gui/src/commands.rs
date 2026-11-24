@@ -2004,6 +2004,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: None,
         },
+        RenameSession(name) => CommandDef {
+            brief: format!("Rename session to `{name}`").into(),
+            doc: "Rename the remote session (in a remote tab) or the local workspace".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &[],
+            icon: None,
+        },
         CopyMode(copy_mode) => CommandDef {
             brief: format!("{copy_mode:?}").into(),
             doc: "".into(),
