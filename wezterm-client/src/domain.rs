@@ -17,6 +17,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use wezterm_term::TerminalSize;
 
+mod remote_tabs;
+
 pub struct ClientInner {
     pub client: Client,
     pub local_domain_id: DomainId,
@@ -255,6 +257,7 @@ pub struct ClientDomain {
     label: String,
     inner: Mutex<Option<Arc<ClientInner>>>,
     local_domain_id: DomainId,
+    in_tab: Mutex<remote_tabs::InTabState>,
 }
 
 async fn update_remote_workspace(
@@ -405,6 +408,7 @@ impl ClientDomain {
             label,
             inner: Mutex::new(None),
             local_domain_id,
+            in_tab: Mutex::new(remote_tabs::InTabState::default()),
         }
     }
 
@@ -418,9 +422,30 @@ impl ClientDomain {
 
     pub fn perform_detach(&self) {
         log::info!("detached domain {}", self.local_domain_id);
+        let mirrored_tabs: Vec<TabId> = self
+            .inner()
+            .map(|inner| {
+                inner
+                    .remote_to_local_tab
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let was_in_tab = self.restore_all_slots();
         self.inner.lock().unwrap().take();
         let mux = Mux::get();
         mux.domain_was_detached(self.local_domain_id);
+        if was_in_tab {
+            // Remote tabs that were not shown in any window are not reached
+            // by domain_was_detached. The domain is detached now, so this
+            // does not kill anything on the server.
+            for tab_id in mirrored_tabs {
+                mux.remove_tab(tab_id);
+            }
+        }
     }
 
     pub fn remote_to_local_pane_id(&self, remote_pane_id: TabId) -> Option<TabId> {
@@ -507,6 +532,12 @@ impl ClientDomain {
         mut primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
+        let domain = mux.get_domain(inner.local_domain_id);
+        let client_domain = domain
+            .as_ref()
+            .and_then(|d| d.downcast_ref::<ClientDomain>());
+        let in_tab = client_domain.map(|d| d.is_in_tab_mode()).unwrap_or(false);
+        let mut remote_tab_infos = vec![];
         log::debug!(
             "domain {}: ListPanes result {:#?}",
             inner.local_domain_id,
@@ -618,6 +649,17 @@ impl ClientDomain {
                     }
                 });
 
+                remote_tab_infos.push(remote_tabs::RemoteTabInfo {
+                    remote_tab_id,
+                    remote_window_id,
+                    workspace: workspace.clone().unwrap_or_default(),
+                });
+                if in_tab {
+                    // Remote tabs are shown in local tabs rather than in
+                    // windows of their own; see remote_tabs.rs.
+                    continue;
+                }
+
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                     let mut window = mux
                         .get_window_mut(local_window_id)
@@ -701,6 +743,13 @@ impl ClientDomain {
             let mut panes = inner.remote_to_local_pane.lock().unwrap();
             for p in remote_panes_to_forget {
                 panes.remove(&p);
+            }
+        }
+
+        if let Some(client_domain) = client_domain {
+            client_domain.in_tab.lock().unwrap().remote_tabs = remote_tab_infos;
+            if in_tab {
+                client_domain.reconcile_slots_after_sync();
             }
         }
 
@@ -821,6 +870,17 @@ impl Domain for ClientDomain {
         command_dir: Option<String>,
         window: WindowId,
     ) -> anyhow::Result<Arc<Tab>> {
+        if self.is_in_tab_mode() {
+            // A new tab opened from a remote tab is a local tab, as in a
+            // terminal where the remote session runs inside one tab.
+            // The remote working directory means nothing locally.
+            let default_domain = Mux::get().default_domain();
+            if default_domain.domain_id() == self.local_domain_id {
+                bail!("remote tabs need a local default domain to open new tabs in");
+            }
+            return default_domain.spawn(size, command, None, window).await;
+        }
+
         let inner = self
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
@@ -994,8 +1054,15 @@ impl Domain for ClientDomain {
     }
 
     fn detach(&self) -> anyhow::Result<()> {
+        if self.detach_closed_windows_only() {
+            return Ok(());
+        }
         self.perform_detach();
         Ok(())
+    }
+
+    fn before_prune_dead_windows(&self) {
+        self.handle_dead_slots();
     }
 
     fn state(&self) -> DomainState {

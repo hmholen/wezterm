@@ -196,6 +196,11 @@ pub trait Domain: Downcast + Send + Sync {
 
     /// Indicates the state of the domain
     fn state(&self) -> DomainState;
+
+    /// Called by `Mux::prune_dead_windows` before it removes dead tabs
+    /// from windows, so that a domain can put something else in place
+    /// of a tab that is about to go away.
+    fn before_prune_dead_windows(&self) {}
 }
 impl_downcast!(Domain);
 

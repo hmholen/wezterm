@@ -230,7 +230,11 @@ impl ClientPane {
                 log::trace!("advised of remote pane focus: {pane_id}");
 
                 let mux = Mux::get();
-                if let Err(err) = mux.focus_pane_and_containing_tab(self.local_pane_id) {
+                if mux.resolve_pane_id(self.local_pane_id).is_none() {
+                    // A remote tab that is not shown in any window right
+                    // now (see domain/remote_tabs.rs); nothing to focus.
+                    log::trace!("pane {} is not in a window", self.local_pane_id);
+                } else if let Err(err) = mux.focus_pane_and_containing_tab(self.local_pane_id) {
                     log::error!("Error reconciling remote PaneFocused notification: {err:#}");
                 }
             }

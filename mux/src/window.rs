@@ -92,6 +92,15 @@ impl Window {
         self.invalidate();
     }
 
+    /// Put `tab` in place of the tab at `index`, keeping the active tab
+    /// index unchanged, and return the tab that was there.
+    pub fn replace_tab_at_idx(&mut self, index: usize, tab: &Arc<Tab>) -> Arc<Tab> {
+        self.assert_tab_isnt_already_in_window(tab);
+        let old = std::mem::replace(&mut self.tabs[index], Arc::clone(tab));
+        self.invalidate();
+        old
+    }
+
     /// Insert `tab` in window, after other tabs.
     pub fn push_tab(&mut self, tab: &Arc<Tab>) {
         self.assert_tab_isnt_already_in_window(tab);

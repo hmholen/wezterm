@@ -52,6 +52,7 @@ use mux::tab::{
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
+use wezterm_client::domain::ClientDomain;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
@@ -2208,6 +2209,19 @@ impl TermWindow {
         Ok(())
     }
 
+    /// If the active tab is a remote tab (see `AttachDomainInTab`), its
+    /// client domain and tab id.
+    fn active_remote_tab(&self) -> Option<(Arc<dyn mux::domain::Domain>, TabId)> {
+        let mux = Mux::get();
+        let tab = mux.get_active_tab_for_window(self.mux_window_id)?;
+        let pane = tab.get_active_pane()?;
+        let domain = mux.get_domain(pane.domain_id())?;
+        domain
+            .downcast_ref::<ClientDomain>()?
+            .session_for_tab(tab.tab_id())?;
+        Some((domain, tab.tab_id()))
+    }
+
     fn activate_tab_relative(&mut self, delta: isize, wrap: bool) -> anyhow::Result<()> {
         let mux = Mux::get();
         let window = mux
@@ -3057,7 +3071,83 @@ impl TermWindow {
             }
             DetachDomain(domain) => {
                 let domain = Mux::get().resolve_spawn_tab_domain(Some(pane.pane_id()), domain)?;
-                domain.detach()?;
+                match self.active_remote_tab() {
+                    // In a remote tab of that domain: just this tab goes back
+                    // to being local.
+                    Some((remote, tab_id)) if remote.domain_id() == domain.domain_id() => {
+                        remote
+                            .downcast_ref::<ClientDomain>()
+                            .expect("active_remote_tab gives a ClientDomain")
+                            .detach_slot(tab_id)?;
+                    }
+                    _ => domain.detach()?,
+                }
+            }
+            AttachDomainInTab(name) => {
+                let window = self.mux_window_id;
+                let tab_id = Mux::get()
+                    .get_active_tab_for_window(window)
+                    .ok_or_else(|| anyhow!("window has no active tab"))?
+                    .tab_id();
+                let name = name.to_string();
+                promise::spawn::spawn(async move {
+                    let result = async {
+                        let domain = Mux::get()
+                            .get_domain_by_name(&name)
+                            .ok_or_else(|| anyhow!("{name} is not a valid domain name"))?;
+                        let client = domain.downcast_ref::<ClientDomain>().ok_or_else(|| {
+                            anyhow!("{name} is not a multiplexer (ssh, unix or tls) domain")
+                        })?;
+                        client.attach_in_tab(window, tab_id).await
+                    }
+                    .await;
+                    if let Err(err) = result {
+                        log::error!("AttachDomainInTab {name}: {err:#}");
+                    }
+                })
+                .detach();
+            }
+            SessionTabRelative(n) => match self.active_remote_tab() {
+                Some((remote, tab_id)) => remote
+                    .downcast_ref::<ClientDomain>()
+                    .expect("active_remote_tab gives a ClientDomain")
+                    .session_tab_relative(tab_id, *n)?,
+                None => self.activate_tab_relative(*n, true)?,
+            },
+            ActivateSessionTab(n) => match self.active_remote_tab() {
+                Some((remote, tab_id)) => remote
+                    .downcast_ref::<ClientDomain>()
+                    .expect("active_remote_tab gives a ClientDomain")
+                    .activate_session_tab(tab_id, *n)?,
+                None => self.activate_tab(*n)?,
+            },
+            SpawnSessionTab => match self.active_remote_tab() {
+                Some((remote, tab_id)) => {
+                    promise::spawn::spawn(async move {
+                        let client = remote
+                            .downcast_ref::<ClientDomain>()
+                            .expect("active_remote_tab gives a ClientDomain");
+                        if let Err(err) = client.spawn_session_tab(tab_id).await {
+                            log::error!("SpawnSessionTab: {err:#}");
+                        }
+                    })
+                    .detach();
+                }
+                None => self.spawn_tab(&config::keyassignment::SpawnTabDomain::CurrentPaneDomain),
+            },
+            SwitchToRemoteSession { name } => {
+                if let Some((remote, tab_id)) = self.active_remote_tab() {
+                    let name = name.clone();
+                    promise::spawn::spawn(async move {
+                        let client = remote
+                            .downcast_ref::<ClientDomain>()
+                            .expect("active_remote_tab gives a ClientDomain");
+                        if let Err(err) = client.switch_session(tab_id, name).await {
+                            log::error!("SwitchToRemoteSession: {err:#}");
+                        }
+                    })
+                    .detach();
+                }
             }
             AttachDomain(domain) => {
                 let window = self.mux_window_id;

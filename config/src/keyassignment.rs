@@ -632,6 +632,24 @@ pub enum KeyAssignment {
     ClearKeyTableStack,
     DetachDomain(SpawnTabDomain),
     AttachDomain(String),
+    /// Connect to the named multiplexer domain inside the current tab: the
+    /// tab shows a remote session (a workspace on the server) and the local
+    /// tab comes back on DetachDomain.
+    AttachDomainInTab(String),
+    /// In a remote tab, show the remote tab this many places away in the
+    /// session; elsewhere the same as ActivateTabRelative.
+    SessionTabRelative(isize),
+    /// In a remote tab, show the session's remote tab with this index
+    /// (negative counts from the end); elsewhere the same as ActivateTab.
+    ActivateSessionTab(isize),
+    /// In a remote tab, open a new remote tab in the session; elsewhere the
+    /// same as SpawnTab(CurrentPaneDomain).
+    SpawnSessionTab,
+    /// In a remote tab, show the named remote session, creating it if
+    /// needed (a new, generated name if `name` is not given).
+    SwitchToRemoteSession {
+        name: Option<String>,
+    },
 
     CopyMode(CopyModeAssignment),
     RotatePanes(RotationDirection),

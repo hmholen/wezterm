@@ -18,6 +18,7 @@ use mux::termwiztermtab::TermWizTerminal;
 use mux::window::WindowId;
 use mux::Mux;
 use rayon::prelude::*;
+use wezterm_client::domain::ClientDomain;
 use std::collections::BTreeMap;
 use termwiz::cell::{AttributeChange, CellAttributes};
 use termwiz::color::ColorAttribute;
@@ -58,6 +59,9 @@ pub struct LauncherArgs {
     title: String,
     active_workspace: String,
     workspaces: Vec<String>,
+    /// When launched from a remote tab (see `AttachDomainInTab`), the
+    /// workspace entries are the remote sessions instead.
+    remote_sessions: bool,
     help_text: String,
     fuzzy_help_text: String,
     alphabet: String,
@@ -77,9 +81,26 @@ impl LauncherArgs {
     ) -> Self {
         let mux = Mux::get();
 
-        let active_workspace = mux.active_workspace();
+        let mut active_workspace = mux.active_workspace();
 
-        let workspaces = if flags.contains(LauncherFlags::WORKSPACES) {
+        let remote = if flags.contains(LauncherFlags::WORKSPACES) {
+            mux.get_active_tab_for_window(mux_window_id)
+                .and_then(|tab| {
+                    let pane = tab.get_active_pane()?;
+                    let domain = mux.get_domain(pane.domain_id())?;
+                    let client = domain.downcast_ref::<ClientDomain>()?;
+                    let session = client.session_for_tab(tab.tab_id())?;
+                    Some((session, client.remote_sessions()))
+                })
+        } else {
+            None
+        };
+        let remote_sessions = remote.is_some();
+
+        let workspaces = if let Some((session, sessions)) = remote {
+            active_workspace = session;
+            sessions
+        } else if flags.contains(LauncherFlags::WORKSPACES) {
             mux.iter_workspaces()
         } else {
             vec![]
@@ -162,6 +183,7 @@ impl LauncherArgs {
             title: title.to_string(),
             workspaces,
             active_workspace,
+            remote_sessions,
             help_text: help_text.to_string(),
             fuzzy_help_text: fuzzy_help_text.to_string(),
             alphabet: alphabet.to_string(),
@@ -270,7 +292,25 @@ impl LauncherState {
             self.entries.push(entry);
         }
 
-        if args.flags.contains(LauncherFlags::WORKSPACES) {
+        if args.remote_sessions {
+            for ws in &args.workspaces {
+                if *ws != args.active_workspace {
+                    self.entries.push(Entry {
+                        label: format!("Switch to remote session: `{}`", ws),
+                        action: KeyAssignment::SwitchToRemoteSession {
+                            name: Some(ws.clone()),
+                        },
+                    });
+                }
+            }
+            self.entries.push(Entry {
+                label: format!(
+                    "Create new remote session (current is `{}`)",
+                    args.active_workspace
+                ),
+                action: KeyAssignment::SwitchToRemoteSession { name: None },
+            });
+        } else if args.flags.contains(LauncherFlags::WORKSPACES) {
             for ws in &args.workspaces {
                 if *ws != args.active_workspace {
                     self.entries.push(Entry {

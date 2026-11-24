@@ -907,6 +907,13 @@ impl Mux {
             log::trace!("prune_dead_windows: Activity::count={}", Activity::count());
             return;
         }
+        // The hook may change windows, so only run it when our caller isn't
+        // holding them; in that case we bail out below anyway.
+        if self.windows.try_write().is_some() {
+            for domain in self.iter_domains() {
+                domain.before_prune_dead_windows();
+            }
+        }
         let live_tab_ids: Vec<TabId> = self.tabs.read().keys().cloned().collect();
         let mut dead_windows = vec![];
         let dead_tab_ids: Vec<TabId>;
