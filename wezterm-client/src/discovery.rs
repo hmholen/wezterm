@@ -230,7 +230,10 @@ mod windows {
                 let path = std::str::from_utf8(&source_slice[0..len])
                     .context("reading path from shared memory")?;
 
-                let path: PathBuf = path.into();
+                // Only the file name is published (see `new`); the socket
+                // itself lives in RUNTIME_DIR. Resolve it there rather than
+                // relative to the caller's current directory.
+                let path = config::RUNTIME_DIR.join(path);
 
                 Ok(path)
             })
