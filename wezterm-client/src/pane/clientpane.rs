@@ -391,6 +391,9 @@ impl Pane for ClientPane {
     }
 
     fn set_zoomed(&self, zoomed: bool) {
+        self.client
+            .zoom_changes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let render = self.renderable.lock();
         let mut inner = render.inner.borrow_mut();
         let client = Arc::clone(&self.client);

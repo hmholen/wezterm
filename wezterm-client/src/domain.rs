@@ -33,6 +33,10 @@ pub struct ClientInner {
     /// echo of an older request arriving after a newer one must not move
     /// the focus back (see ClientPane's PaneFocused handling).
     pub recent_focus_requests: Mutex<std::collections::VecDeque<(PaneId, std::time::Instant)>>,
+    /// Bumped whenever a pane of ours is zoomed or unzoomed locally (which
+    /// sends SetPaneZoomed). A pane list requested before the latest bump
+    /// may still show the old zoom state; see `resync`.
+    pub zoom_changes: std::sync::atomic::AtomicUsize,
 }
 
 /// How long a focus request of ours may still come back as an echo.
@@ -283,6 +287,7 @@ impl ClientInner {
             remote_to_local_pane: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
             recent_focus_requests: Mutex::new(std::collections::VecDeque::new()),
+            zoom_changes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -302,6 +307,20 @@ async fn update_remote_workspace(
     let inner = ClientDomain::get_client_inner_for_domain(local_domain_id)?;
     inner.client.set_window_workspace(pdu).await?;
     Ok(())
+}
+
+/// Mark `zoomed` (a remote pane id) as the only zoomed pane in `node`.
+fn set_zoomed_pane_in_tree(node: &mut mux::tab::PaneNode, zoomed: Option<PaneId>) {
+    match node {
+        mux::tab::PaneNode::Empty => {}
+        mux::tab::PaneNode::Leaf(entry) => {
+            entry.is_zoomed_pane = Some(entry.pane_id) == zoomed;
+        }
+        mux::tab::PaneNode::Split { left, right, .. } => {
+            set_zoomed_pane_in_tree(left, zoomed);
+            set_zoomed_pane_in_tree(right, zoomed);
+        }
+    }
 }
 
 fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -> bool {
@@ -540,8 +559,19 @@ impl ClientDomain {
 
     pub async fn resync(&self) -> anyhow::Result<()> {
         if let Some(inner) = self.inner() {
+            use std::sync::atomic::Ordering;
+            let zoom_changes = inner.zoom_changes.load(Ordering::SeqCst);
             let panes = inner.client.list_panes().await?;
-            Self::process_pane_list(inner, panes, None)?;
+            // If a pane was zoomed or unzoomed here while the list was on
+            // its way, the list may predate that change. Taking its zoom
+            // state would undo the change locally and resize the pane to
+            // match, and the server, already past the change, would then
+            // bake that size into its split layout: e.g. a pane unzoomed
+            // just after zooming stays as large as the whole tab. On a
+            // slow link this happens easily, since every zoom triggers a
+            // resync.
+            let keep_local_zoom = inner.zoom_changes.load(Ordering::SeqCst) != zoom_changes;
+            Self::process_pane_list_inner(inner, panes, None, keep_local_zoom)?;
         }
         Ok(())
     }
@@ -569,7 +599,18 @@ impl ClientDomain {
     fn process_pane_list(
         inner: Arc<ClientInner>,
         panes: ListPanesResponse,
+        primary_window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
+        Self::process_pane_list_inner(inner, panes, primary_window_id, false)
+    }
+
+    /// With `keep_local_zoom`, the zoom state of tabs we already have is
+    /// kept as it is locally instead of being taken from `panes`.
+    fn process_pane_list_inner(
+        inner: Arc<ClientInner>,
+        panes: ListPanesResponse,
         mut primary_window_id: Option<WindowId>,
+        keep_local_zoom: bool,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
         let domain = mux.get_domain(inner.local_domain_id);
@@ -647,6 +688,15 @@ impl ClientDomain {
                 tab.set_title(tab_title);
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
+                let mut tabroot = tabroot;
+                if keep_local_zoom && !tab.iter_panes_ignoring_zoom().is_empty() {
+                    let zoomed = tab.get_zoomed_pane().and_then(|p| {
+                        p.downcast_ref::<ClientPane>()
+                            .map(|client_pane| client_pane.remote_pane_id)
+                    });
+                    set_zoomed_pane_in_tree(&mut tabroot, zoomed);
+                }
+
                 let mut workspace = None;
                 tab.sync_with_pane_tree(root_size, tabroot, |entry| {
                     workspace.replace(entry.workspace.clone());
