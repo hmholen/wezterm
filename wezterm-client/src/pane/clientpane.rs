@@ -230,7 +230,15 @@ impl ClientPane {
                 log::trace!("advised of remote pane focus: {pane_id}");
 
                 let mux = Mux::get();
-                if mux.resolve_pane_id(self.local_pane_id).is_none() {
+                if self.client.is_stale_focus_echo(pane_id) {
+                    // The echo of a focus change we sent before our latest
+                    // one. Following it would move the focus back to where
+                    // it was; with a slow link, two such echoes in flight
+                    // make the focus bounce between two panes forever, each
+                    // move sending another SetFocusedPane. Our latest
+                    // request is the one the server ends up with anyway.
+                    log::trace!("ignoring stale echo of our focus change to {pane_id}");
+                } else if mux.resolve_pane_id(self.local_pane_id).is_none() {
                     // A remote tab that is not shown in any window right
                     // now (see domain/remote_tabs.rs); nothing to focus.
                     log::trace!("pane {} is not in a window", self.local_pane_id);
@@ -605,6 +613,8 @@ impl Pane for ClientPane {
             focused_pane.replace(self.remote_pane_id);
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
+            drop(focused_pane);
+            client.note_focus_request(remote_pane_id);
             promise::spawn::spawn(async move {
                 client
                     .client

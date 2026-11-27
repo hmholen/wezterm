@@ -28,6 +28,40 @@ pub struct ClientInner {
     remote_to_local_tab: Mutex<HashMap<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    /// Remote panes we recently asked the server to focus, and when. The
+    /// server echoes each SetFocusedPane back to us as PaneFocused; an
+    /// echo of an older request arriving after a newer one must not move
+    /// the focus back (see ClientPane's PaneFocused handling).
+    pub recent_focus_requests: Mutex<std::collections::VecDeque<(PaneId, std::time::Instant)>>,
+}
+
+/// How long a focus request of ours may still come back as an echo.
+pub(crate) const FOCUS_ECHO_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl ClientInner {
+    /// Record that we asked the server to focus `remote_pane_id`.
+    pub(crate) fn note_focus_request(&self, remote_pane_id: PaneId) {
+        let now = std::time::Instant::now();
+        let mut recent = self.recent_focus_requests.lock().unwrap();
+        recent.retain(|(_, at)| now.duration_since(*at) < FOCUS_ECHO_WINDOW);
+        recent.push_back((remote_pane_id, now));
+    }
+
+    /// Whether a PaneFocused for `remote_pane_id` from the server is
+    /// likely a late echo of one of our own earlier focus requests,
+    /// superseded by a later one.
+    pub(crate) fn is_stale_focus_echo(&self, remote_pane_id: PaneId) -> bool {
+        let latest = *self.focused_remote_pane_id.lock().unwrap();
+        if latest == Some(remote_pane_id) {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        self.recent_focus_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(pane, at)| *pane == remote_pane_id && now.duration_since(*at) < FOCUS_ECHO_WINDOW)
+    }
 }
 
 impl ClientInner {
@@ -248,6 +282,7 @@ impl ClientInner {
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
+            recent_focus_requests: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 }

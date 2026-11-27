@@ -80,6 +80,22 @@ impl GuiFrontEnd {
                 MuxNotification::PaneFocused(pane_id) => {
                     promise::spawn::spawn_into_main_thread(async move {
                         let mux = Mux::get();
+                        // This runs later than the focus change it reports.
+                        // If the focus has moved on to another pane of the
+                        // tab since, it is stale: applying it would move the
+                        // focus back, which notifies again, and two such
+                        // notifications queued together would keep swapping
+                        // the focus between their panes forever.
+                        let still_active = mux
+                            .resolve_pane_id(pane_id)
+                            .and_then(|(_, _, tab_id)| mux.get_tab(tab_id))
+                            .and_then(|tab| tab.get_active_pane())
+                            .map(|p| p.pane_id() == pane_id)
+                            .unwrap_or(true);
+                        if !still_active {
+                            log::trace!("ignoring stale PaneFocused({pane_id})");
+                            return;
+                        }
                         if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
                             log::error!("Error reconciling PaneFocused notification: {err:#}");
                         }
